@@ -7,9 +7,11 @@ from . import discovery, models, schemas
 from .db import Base, engine, get_db
 from .outreach_api import router as outreach_router
 from .scoring import score_lead
+from .sites_api import router as sites_router
 
-app = FastAPI(title="Lead Gen API", version="0.2.0")
+app = FastAPI(title="Lead Gen API", version="0.3.0")
 app.include_router(outreach_router)
+app.include_router(sites_router)
 
 
 @app.on_event("startup")

@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     # Model names change often. If you get a 404, check the current free-tier model in Google AI Studio.
     gemini_model: str = "gemini-2.5-flash"
     sender_name: str = "Aditya"
+    vercel_token: str = ""
+    vercel_team_id: str = ""  # only if you deploy under a team, else leave empty
 
 
 settings = Settings()

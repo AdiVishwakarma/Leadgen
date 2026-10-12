@@ -1,502 +1,255 @@
-import requests
+"""Lead Gen dashboard (Streamlit). It only talks to the FastAPI server over HTTP.
+
+Run (FastAPI must already be running on port 8000):
+    streamlit run app/streamlit_app.py
+"""
+import os
+import re
+from urllib.parse import quote
+
+import httpx
 import pandas as pd
 import streamlit as st
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-API_BASE = "http://127.0.0.1:8000"
-
-st.set_page_config(
-    page_title="LeadGen",
-    page_icon="🎯",
-    layout="wide",
-)
-
-# ============================================================
-# SESSION STATE
-# ============================================================
-
-if "leads" not in st.session_state:
-    st.session_state["leads"] = []
-
-# ============================================================
-# API HELPERS
-# ============================================================
-
-def discover_leads(category: str, city: str, limit: int) -> dict:
-    response = requests.post(
-        f"{API_BASE}/discover",
-        json={
-            "category": category.lower().strip(),
-            "city": city.strip(),
-            "limit": limit,
-        },
-        timeout=120,
-    )
-    response.raise_for_status()
-    return response.json()
+DEFAULT_API = os.getenv("LEADGEN_API", "http://127.0.0.1:8000")
+OPT_OUT = "won't message again"
+STATUS_FILTERS = ["Sab", "audited", "drafted", "site_ready", "contacted"]
 
 
-def audit_pending(batch: int) -> dict:
-    response = requests.post(
-        f"{API_BASE}/audit/pending",
-        params={"batch": batch},
-        timeout=300,
-    )
-    response.raise_for_status()
-    return response.json()
+# ------------------------------------------------------------------ pure helpers (unit tested)
+def wa_number(phone: str | None) -> tuple[str | None, str | None]:
+    """Indian phone -> WhatsApp number (91XXXXXXXXXX). Returns (number, problem)."""
+    digits = re.sub(r"\D", "", phone or "")
+    if digits.startswith("00"):
+        digits = digits[2:]
+    national = digits[2:] if digits.startswith("91") and len(digits) == 12 else digits.lstrip("0")
+    if len(national) != 10:
+        return None, "Number ka format samajh nahi aaya"
+    if national[0] not in "6789":
+        return None, "Ye landline lagta hai, WhatsApp pe nahi hoga"
+    return "91" + national, None
 
 
-def get_leads() -> list:
-    response = requests.get(
-        f"{API_BASE}/leads",
-        params={
-            "min_score": 0,
-            "limit": 200,
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-    return response.json()
+def with_link(message: str, url: str | None) -> str:
+    """Put the demo link into the draft. The draft asks 'want a free preview?'; once the page
+    exists we replace that question with the link. No question found -> link goes above the opt-out line."""
+    msg = message.strip()
+    if not url:
+        return msg
+    sentence = f"I've already put together a quick demo page for you to look at: {url}"
+    m = re.search(r"[^.?!\n]*\bpreview\b[^.?!\n]*\?", msg, flags=re.I)
+    if m:
+        return msg[: m.start()] + sentence + msg[m.end():]
+    idx = msg.lower().replace("’", "'").find(OPT_OUT)
+    if idx == -1:
+        return f"{msg}\n\n{sentence}"
+    start = msg.rfind("\n", 0, idx)
+    start = 0 if start == -1 else start
+    return f"{msg[:start].rstrip()}\n\n{sentence}\n\n{msg[start:].lstrip()}"
 
-# ============================================================
-# CATEGORY OPTIONS
-# ============================================================
 
-CATEGORY_OPTIONS = [
-    "Dentist",
-    "Restaurant",
-    "Cafe",
-    "Bakery",
-    "Salon",
-    "Beauty Spa",
-    "Gym",
-    "Fitness Center",
-    "Doctor",
-    "Clinic",
-    "Hospital",
-    "Physiotherapist",
-    "Dermatologist",
-    "Veterinary Clinic",
-    "Pharmacy",
-    "Lawyer",
-    "Chartered Accountant",
-    "Real Estate Agency",
-    "Interior Designer",
-    "Architect",
-    "Coaching Center",
-    "School",
-    "Daycare",
-    "Pet Store",
-    "Car Dealer",
-    "Bike Dealer",
-    "Car Repair",
-    "Electronics Store",
-    "Furniture Store",
-    "Jewellery Store",
-    "Photographer",
-    "Travel Agency",
-    "Event Planner",
-    "Hotel",
-    "Other",
-]
+def short_site(url: str | None) -> str:
+    return re.sub(r"^https?://(www\.)?", "", url or "").split("/")[0] if url else "Nahi"
 
-# ============================================================
-# CATEGORY MATCHING
-# ============================================================
 
-def category_matches(selected_category: str, db_category: str) -> bool:
-
-    selected = selected_category.strip().lower()
-    actual = str(db_category or "").strip().lower()
-
-    if not actual:
-        return False
-
-    if selected == "other":
-        return True
-
-    # Dentist
-    if selected == "dentist":
-        keywords = [
-            "dentist",
-            "dental",
-            "orthodont",
-            "oral surgeon",
-        ]
-        return any(k in actual for k in keywords)
-
-    # Restaurant
-    if selected in ["restaurant", "restaurants"]:
-        return (
-            "restaurant" in actual
-            or "bar & grill" in actual
-        )
-
-    # Salon
-    if selected == "salon":
-        keywords = [
-            "salon",
-            "barber",
-            "hairdresser",
-            "hair studio",
-            "beauty parlour",
-            "beauty parlor",
-        ]
-        return any(k in actual for k in keywords)
-
-    # Cafe
-    if selected == "cafe":
-        keywords = [
-            "cafe",
-            "coffee",
-            "cafeteria",
-        ]
-        return any(k in actual for k in keywords)
-
-    # Bakery
-    if selected == "bakery":
-        keywords = [
-            "bakery",
-            "cake",
-            "pastry",
-        ]
-        return any(k in actual for k in keywords)
-
-    # Gym / Fitness
-    if selected in ["gym", "fitness center"]:
-        keywords = [
-            "gym",
-            "fitness",
-            "crossfit",
-            "workout",
-        ]
-        return any(k in actual for k in keywords)
-
-    # Hotel
-    if selected == "hotel":
-        keywords = [
-            "hotel",
-            "resort",
-            "lodging",
-            "guest house",
-        ]
-        return any(k in actual for k in keywords)
-
-    # Lawyer
-    if selected == "lawyer":
-        keywords = [
-            "lawyer",
-            "law firm",
-            "attorney",
-            "legal",
-        ]
-        return any(k in actual for k in keywords)
-
-    # Real Estate
-    if selected == "real estate agency":
-        keywords = [
-            "real estate",
-            "realty",
-            "property",
-        ]
-        return any(k in actual for k in keywords)
-
-    # Photographer
-    if selected == "photographer":
-        keywords = [
-            "photographer",
-            "photography",
-            "photo studio",
-        ]
-        return any(k in actual for k in keywords)
-
-    # Travel
-    if selected == "travel agency":
-        keywords = [
-            "travel",
-            "tour agency",
-        ]
-        return any(k in actual for k in keywords)
-
-    # Generic fallback
-    return (
-        selected in actual
-        or actual in selected
-    )
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-st.sidebar.title("Lead Discovery")
-
-category = st.sidebar.selectbox(
-    "Category",
-    CATEGORY_OPTIONS,
-)
-
-custom_category = ""
-
-if category == "Other":
-    custom_category = st.sidebar.text_input(
-        "Enter custom category",
-        placeholder="e.g. yoga studio",
-    )
-
-city = st.sidebar.text_input(
-    "City",
-    value="Vasai",
-)
-
-limit = st.sidebar.number_input(
-    "Number of leads",
-    min_value=1,
-    max_value=50,
-    value=20,
-)
-
-audit_batch = st.sidebar.number_input(
-    "Audit batch",
-    min_value=1,
-    max_value=50,
-    value=10,
-)
-
-# ============================================================
-# HEADER
-# ============================================================
-
-st.title("🎯 LeadGen")
-st.caption(
-    "Business lead discovery and website opportunity scoring"
-)
-
-# ============================================================
-# DISCOVER BUTTON
-# ============================================================
-
-if st.sidebar.button(
-    "🔎 Discover Leads",
-    use_container_width=True,
-):
-
-    selected_category = (
-        custom_category.strip()
-        if category == "Other"
-        else category
-    )
-
-    if not selected_category:
-        st.sidebar.error("Enter a category.")
-    elif not city.strip():
-        st.sidebar.error("Enter a city.")
-    else:
-
-        with st.spinner(
-            f"Searching {selected_category} businesses in {city}..."
-        ):
-            try:
-
-                result = discover_leads(
-                    selected_category,
-                    city,
-                    int(limit),
-                )
-
-                st.success(
-                    f"Found: {result['found']} | "
-                    f"Inserted: {result['inserted']} | "
-                    f"Duplicates: {result['skipped_duplicates']}"
-                )
-
-                st.session_state["leads"] = get_leads()
-
-            except requests.RequestException as exc:
-                st.error(f"Discovery failed: {exc}")
-
-# ============================================================
-# AUDIT BUTTON
-# ============================================================
-
-if st.sidebar.button(
-    "🌐 Audit Pending Leads",
-    use_container_width=True,
-):
-
-    with st.spinner("Auditing pending websites..."):
-
+# ------------------------------------------------------------------ API + UI glue
+def api(base: str, method: str, path: str, timeout: int = 120, **kw):
+    """Returns (data, error). Never raises."""
+    try:
+        r = httpx.request(method, base + path, timeout=timeout, **kw)
+    except httpx.HTTPError as exc:
+        return None, f"API se connect nahi hua ({type(exc).__name__}). FastAPI server chal raha hai?"
+    if r.status_code >= 400:
         try:
+            detail = r.json().get("detail", r.text)
+        except Exception:  # noqa: BLE001
+            detail = r.text
+        return None, f"{r.status_code}: {detail}"
+    return r.json(), None
 
-            result = audit_pending(
-                int(audit_batch)
-            )
 
-            st.success(
-                f"Audited: {result['audited']} leads"
-            )
+def link(label: str, url: str) -> None:
+    if hasattr(st, "link_button"):
+        st.link_button(label, url)
+    else:  # very old Streamlit
+        st.markdown(f"[{label}]({url})")
 
-            st.session_state["leads"] = get_leads()
 
-        except requests.RequestException as exc:
-            st.error(f"Audit failed: {exc}")
+def rerun() -> None:
+    (st.rerun if hasattr(st, "rerun") else st.experimental_rerun)()
 
-# ============================================================
-# LOAD BUTTON
-# ============================================================
 
-if st.sidebar.button(
-    "📊 Load Leads",
-    use_container_width=True,
-):
+def flash(kind: str, text: str) -> None:
+    st.session_state["flash"] = (kind, text)
 
-    with st.spinner("Loading leads..."):
 
-        try:
+def main() -> None:
+    st.set_page_config(page_title="Lead Gen", layout="wide")
+    st.title("Lead Gen dashboard")
 
-            st.session_state["leads"] = get_leads()
+    note = st.session_state.pop("flash", None)
+    if note:
+        (st.success if note[0] == "ok" else st.error)(note[1])
 
-        except requests.RequestException as exc:
-            st.error(f"Could not load leads: {exc}")
+    # ---------------- sidebar: find + audit
+    base = st.sidebar.text_input("API address", DEFAULT_API).rstrip("/")
 
-# ============================================================
-# DISPLAY DATA
-# ============================================================
+    with st.sidebar.form("discover"):
+        st.subheader("1. Nayi leads dhoondho")
+        category = st.text_input("Category", "dentist")
+        city = st.text_input("City", "Vasai")
+        limit = st.number_input("Kitni leads", min_value=1, max_value=60, value=20)
+        go = st.form_submit_button("Dhoondho")
+    if go:
+        with st.spinner("Google se leads la raha hoon..."):
+            data, err = api(base, "POST", "/discover", json={"category": category, "city": city, "limit": int(limit)})
+        flash("err" if err else "ok", err or f"{data['found']} mili, {data['inserted']} nayi, {data['skipped_duplicates']} pehle se thi.")
+        rerun()
 
-leads = st.session_state.get("leads", [])
+    st.sidebar.subheader("2. Website check + score")
+    if st.sidebar.button("Naye leads ka audit chalao"):
+        with st.spinner("Websites check ho rahi hain (thoda time lagega)..."):
+            data, err = api(base, "POST", "/audit/pending", params={"batch": 20}, timeout=600)
+        flash("err" if err else "ok", err or f"{data['audited']} leads ka audit ho gaya.")
+        rerun()
 
-if leads:
+    # ---------------- filters + list
+    f1, f2, f3 = st.columns(3)
+    min_score = f1.slider("Minimum score", 0, 100, 0)
+    status = f2.selectbox("Status", STATUS_FILTERS)
+    no_site_only = f3.checkbox("Sirf bina website wale", value=False)
 
-    df = pd.DataFrame(leads)
+    params: dict = {"min_score": min_score, "limit": 200}
+    if status != "Sab":
+        params["status"] = status
+    leads, err = api(base, "GET", "/leads", params=params)
+    if err:
+        st.error(err)
+        st.stop()
+    if no_site_only:
+        leads = [l for l in leads if not l["website"]]
+    if not leads:
+        st.info("Koi lead nahi mili. Sidebar se leads dhoondho, phir audit chalao.")
+        st.stop()
 
-    selected_category = (
-        custom_category.strip()
-        if category == "Other"
-        else category
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Leads", len(leads))
+    m2.metric("Bina website", sum(1 for l in leads if not l["website"]))
+    m3.metric("Message ready", sum(1 for l in leads if l["status"] in ("drafted", "site_ready")))
+    m4.metric("Bheji gayi", sum(1 for l in leads if l["status"] == "contacted"))
+
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "ID": l["id"], "Naam": l["name"], "Category": l["category"], "Score": l["score"],
+                    "Status": l["status"], "Website": short_site(l["website"]),
+                    "Reviews": l["review_count"], "Phone": l["phone"],
+                }
+                for l in leads
+            ]
+        ),
+        hide_index=True,
     )
 
-    # Category filter
-    if selected_category:
-
-        df = df[
-            df["category"].apply(
-                lambda value: category_matches(
-                    selected_category,
-                    value,
-                )
-            )
-        ]
-
-    # City filter
-    if city.strip():
-
-        df = df[
-            df["city"]
-            .fillna("")
-            .str.contains(
-                city.strip(),
-                case=False,
-                na=False,
-            )
-        ]
-
-    # Sort highest score first
-    if "score" in df.columns:
-
-        df = df.sort_values(
-            "score",
-            ascending=False,
-        )
-
-    # Metrics
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric(
-        "Matching Leads",
-        len(df),
+    # ---------------- one lead
+    by_id = {l["id"]: l for l in leads}
+    # Fixed key + labels without status: otherwise the selection resets to the first lead after every action.
+    sel = st.selectbox(
+        "Lead chun",
+        list(by_id),
+        format_func=lambda i: f"#{i}  {by_id[i]['name']}  (score {by_id[i]['score']})",
+        key="selected_lead",
     )
+    lead = by_id[sel]
+    st.divider()
+    left, right = st.columns(2)
 
-    if not df.empty and "score" in df.columns:
-        col2.metric(
-            "Top Score",
-            int(df["score"].max()),
-        )
-    else:
-        col2.metric("Top Score", 0)
+    with left:
+        st.subheader(lead["name"])
+        st.caption(f"{lead['category'] or ''}  |  {lead['city'] or ''}  |  status: {lead['status']}  |  score: {lead['score']}")
+        st.write(lead["address"] or "")
+        st.write(f"Phone: {lead['phone'] or 'nahi hai'}")
+        if lead["rating"]:
+            st.write(f"Rating: {lead['rating']} ({lead['review_count']} reviews)")
 
-    if not df.empty and "rating" in df.columns:
-        ratings = df["rating"].dropna()
+        audits, _ = api(base, "GET", f"/leads/{sel}/audits")
+        if audits:
+            st.markdown("**Score kyun aaya**")
+            for reason in audits[0]["reasons"]:
+                st.write("- " + reason)
 
-        col3.metric(
-            "Avg Rating",
-            round(ratings.mean(), 1)
-            if not ratings.empty
-            else 0,
-        )
-    else:
-        col3.metric("Avg Rating", 0)
+        st.markdown("**Step 1. Khud confirm kar (bhejne se pehle)**")
+        if lead["website"]:
+            st.warning(f"Is lead ki website hai: {lead['website']}. Pitch dobara soch.")
+        else:
+            st.info("Google Maps listing me website nahi hai. Neeche button se Google pe check kar ki sach me nahi hai.")
+        link("Google pe search karo", "https://www.google.com/search?q=" + quote(f"{lead['name']} {lead['city'] or ''}"))
 
-    if not df.empty and "review_count" in df.columns:
+    with right:
+        # ---- step 2: demo page
+        st.markdown("**Step 2. Demo page**")
+        sites, _ = api(base, "GET", f"/leads/{sel}/site")
+        site_url = sites[0]["url"] if sites else None
+        if st.button("Demo page dobara banao" if site_url else "Demo page banao", key=f"site_{sel}"):
+            with st.spinner("Page bana ke Vercel pe bhej raha hoon..."):
+                data, err = api(base, "POST", f"/leads/{sel}/site", timeout=180)
+            flash("err" if err else "ok", err or "Demo page ready.")
+            rerun()
+        if site_url:
+            st.write(site_url)
+            link("Demo page kholo", site_url)
+        link("Local preview (deploy se pehle)", f"{base}/leads/{sel}/site/preview")
 
-        col4.metric(
-            "Total Reviews",
-            int(
-                df["review_count"]
-                .fillna(0)
-                .sum()
-            ),
-        )
+        # ---- step 3: message
+        st.markdown("**Step 3. Message**")
+        lang = st.radio("Language", ["english", "hinglish"], horizontal=True, key=f"lang_{sel}")
+        open_rows = []
+        for s in ("draft", "approved"):
+            rows, _ = api(base, "GET", "/outreach", params={"status": s, "limit": 200})
+            open_rows += [r for r in (rows or []) if r["lead_id"] == sel]
+        row = max(open_rows, key=lambda r: r["id"]) if open_rows else None
 
-    else:
-        col4.metric(
-            "Total Reviews",
-            0,
-        )
+        if st.button("Naya message banao" if row else "Message banao", key=f"draft_{sel}"):
+            with st.spinner("Gemini message likh raha hai (1 minute tak lag sakta hai)..."):
+                data, err = api(base, "POST", f"/leads/{sel}/outreach", params={"language": lang}, timeout=240)
+            flash("err" if err else "ok", err or "Naya message ready.")
+            rerun()
 
-    st.subheader(
-        f"{selected_category} Leads in {city}"
-    )
+        if row:
+            final = with_link(row["message"], site_url)
+            if not site_url:
+                st.caption("Demo page abhi nahi bana, isliye message me link nahi hai. Pehle Step 2 kar.")
+            st.text_area("Message", final, height=300, disabled=True, key=f"msg_{row['id']}_{bool(site_url)}")
 
-    # Table
-    if df.empty:
+            num, problem = wa_number(lead["phone"])
+            if num:
+                link("WhatsApp me kholo", f"https://wa.me/{num}?text={quote(final)}")
+                st.caption("WhatsApp me message pehle se likha milega. Wahin edit karke send kar sakta hai.")
+            else:
+                st.warning(problem)
+            with st.expander("Copy karne ke liye"):
+                st.code(final, language=None)
 
-        st.warning(
-            "No matching leads found for this category and city."
-        )
+            b1, b2 = st.columns(2)
+            if b1.button("Maine bhej diya", type="primary", key=f"sent_{row['id']}"):
+                err = None
+                if row["status"] == "draft":
+                    _, err = api(base, "POST", f"/outreach/{row['id']}/approve")
+                if not err:
+                    _, err = api(base, "POST", f"/outreach/{row['id']}/mark-sent")
+                flash("err" if err else "ok", err or "Mark ho gaya: lead ab 'contacted' hai.")
+                rerun()
+            if b2.button("Ye message reject karo", key=f"rej_{row['id']}"):
+                _, err = api(base, "POST", f"/outreach/{row['id']}/reject")
+                flash("err" if err else "ok", err or "Reject ho gaya.")
+                rerun()
+        elif lead["status"] == "contacted":
+            st.success("Is lead ko message bheja ja chuka hai.")
 
-    else:
 
-        columns = [
-            "score",
-            "name",
-            "category",
-            "phone",
-            "website",
-            "rating",
-            "review_count",
-            "city",
-            "status",
-            "address",
-        ]
+# Streamlit runs this file as a script; pytest only imports it, so only build the UI when a runtime exists.
+from streamlit import runtime  # noqa: E402
 
-        existing_columns = [
-            c for c in columns
-            if c in df.columns
-        ]
-
-        df = df[existing_columns]
-
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-else:
-
-    st.info(
-        "Click 'Discover Leads' to find new businesses "
-        "or 'Load Leads' to view existing leads."
-    )
+if runtime.exists():
+    main()
