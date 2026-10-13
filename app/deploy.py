@@ -29,6 +29,25 @@ def _make_public(project_id: str, params: dict | None, headers: dict) -> str | N
     return None
 
 
+def _pick_host(project_name: str, aliases: list[str], fallback: str | None) -> str | None:
+    """Public link is project-name.vercel.app. Aliases with the account slug in them stay behind the login wall."""
+    clean = f"{project_name}.vercel.app"
+    if clean in aliases:
+        return clean
+    if aliases:
+        return min(aliases, key=len)  # the shortest alias is the plain one
+    return fallback
+
+
+def _is_open(url: str) -> bool:
+    """True if a stranger (no Vercel login) can load the page."""
+    try:
+        r = httpx.get(url, follow_redirects=True, timeout=20)
+    except httpx.HTTPError:
+        return False
+    return r.status_code == 200 and "vercel.com/sso" not in str(r.url) and "<html" in r.text.lower()
+
+
 def deploy_html(project_name: str, html_text: str) -> dict:
     if not settings.vercel_token:
         raise DeployError("VERCEL_TOKEN is not set")
@@ -39,7 +58,6 @@ def deploy_html(project_name: str, html_text: str) -> dict:
         "name": project_name,
         "files": [{"file": "index.html", "data": html_text}],
         "projectSettings": {"framework": None},
-        # Production target gives a stable project-name.vercel.app alias.
         "target": "production",
     }
     try:
@@ -51,17 +69,18 @@ def deploy_html(project_name: str, html_text: str) -> dict:
         raise DeployError(f"Vercel returned {resp.status_code}: {resp.text[:300]}")
 
     d = resp.json()
-    aliases = d.get("alias") or []
-    host = aliases[0] if aliases else d.get("url")
+    host = f"{d.get('name') or project_name}.vercel.app"
     if not host:
         raise DeployError(f"Vercel response had no URL: {str(d)[:300]}")
+    url = f"https://{host}"
 
     # Without this the link shows "Log in to Vercel" to everyone except you.
     if d.get("projectId"):
         problem = _make_public(d["projectId"], params, headers)
         if problem:
             raise DeployError(
-                f"Page deploy ho gaya ({host}) par public nahi ho paaya: {problem}. "
+                f"Page deploy ho gaya ({url}) par public nahi ho paaya: {problem}. "
                 "Project Settings > Deployment Protection > Vercel Authentication manually band kar."
             )
-    return {"deployment_id": d.get("id"), "url": f"https://{host}", "state": d.get("readyState")}
+
+    return {"deployment_id": d.get("id"), "url": url, "state": d.get("readyState"), "public": _is_open(url)}
