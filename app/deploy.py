@@ -1,4 +1,6 @@
 """Deploy a single index.html to Vercel via the REST API (no CLI needed)."""
+import time
+
 import httpx
 
 from .config import settings
@@ -29,14 +31,33 @@ def _make_public(project_id: str, params: dict | None, headers: dict) -> str | N
     return None
 
 
-def _pick_host(project_name: str, aliases: list[str], fallback: str | None) -> str | None:
-    """Public link is project-name.vercel.app. Aliases with the account slug in them stay behind the login wall."""
-    clean = f"{project_name}.vercel.app"
-    if clean in aliases:
-        return clean
-    if aliases:
-        return min(aliases, key=len)  # the shortest alias is the plain one
-    return fallback
+def _wait_ready(deployment_id: str, params: dict | None, headers: dict, tries: int = 15) -> str | None:
+    """Poll until the deployment is READY (or failed). Returns the final state, or None on timeout."""
+    for _ in range(tries):
+        try:
+            r = httpx.get(f"{VERCEL_URL}/{deployment_id}", params=params, headers=headers, timeout=20)
+            if r.status_code == 200:
+                state = r.json().get("readyState")
+                if state in ("READY", "ERROR", "CANCELED"):
+                    return state
+        except httpx.HTTPError:
+            pass
+        time.sleep(3)
+    return None
+
+
+def _public_host(project_id: str, project_name: str, params: dict | None, headers: dict) -> str:
+    """Ask Vercel which vercel.app domains the project really has; the shortest one is the plain
+    project-name.vercel.app (the ones with the account name added stay behind the login wall)."""
+    try:
+        r = httpx.get(f"{PROJECT_URL}/{project_id}/domains", params=params, headers=headers, timeout=20)
+        if r.status_code == 200:
+            names = [d["name"] for d in r.json().get("domains", []) if d.get("name", "").endswith(".vercel.app")]
+            if names:
+                return min(names, key=len)
+    except (httpx.HTTPError, ValueError, KeyError):
+        pass
+    return f"{project_name}.vercel.app"
 
 
 def _is_open(url: str) -> bool:
@@ -69,18 +90,22 @@ def deploy_html(project_name: str, html_text: str) -> dict:
         raise DeployError(f"Vercel returned {resp.status_code}: {resp.text[:300]}")
 
     d = resp.json()
-    host = f"{d.get('name') or project_name}.vercel.app"
-    if not host:
-        raise DeployError(f"Vercel response had no URL: {str(d)[:300]}")
-    url = f"https://{host}"
+    project_id, deployment_id = d.get("projectId"), d.get("id")
+    if not project_id or not deployment_id:
+        raise DeployError(f"Vercel response had no project/deployment id: {str(d)[:300]}")
 
     # Without this the link shows "Log in to Vercel" to everyone except you.
-    if d.get("projectId"):
-        problem = _make_public(d["projectId"], params, headers)
-        if problem:
-            raise DeployError(
-                f"Page deploy ho gaya ({url}) par public nahi ho paaya: {problem}. "
-                "Project Settings > Deployment Protection > Vercel Authentication manually band kar."
-            )
+    problem = _make_public(project_id, params, headers)
+    if problem:
+        raise DeployError(
+            f"Page deploy ho gaya par public nahi ho paaya: {problem}. "
+            "Project Settings > Deployment Protection > Vercel Authentication manually band kar."
+        )
 
-    return {"deployment_id": d.get("id"), "url": url, "state": d.get("readyState"), "public": _is_open(url)}
+    state = _wait_ready(deployment_id, params, headers) or d.get("readyState")
+    if state in ("ERROR", "CANCELED"):
+        raise DeployError(f"Vercel deployment {state}. Vercel dashboard me us project ke Deployments tab me logs dekh.")
+
+    host = _public_host(project_id, d.get("name") or project_name, params, headers)
+    url = f"https://{host}"
+    return {"deployment_id": deployment_id, "url": url, "state": state, "public": _is_open(url)}
